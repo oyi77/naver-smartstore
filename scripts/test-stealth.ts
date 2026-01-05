@@ -1,3 +1,6 @@
+// =
+// This v1 is for testing PoC of evasion logic
+// =
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { Browser } from 'puppeteer';
@@ -374,6 +377,15 @@ async function runTest() {
             await page.mouse.move(mx, my, { steps: 25 });
             await new Promise(r => setTimeout(r, 500));
         }
+
+        // Inspect outgoing headers for the first few requests
+        await page.setRequestInterception(true);
+        page.on('request', req => {
+            if (req.url().includes('i/v2/channels')) {
+                console.log('📡 Reference Outgoing Headers:', req.headers());
+            }
+            req.continue();
+        });
 
         await page.goto(TARGET_URL + 'products/12647771530', { waitUntil: 'networkidle2', timeout: 60000 });
         console.log(`✅ Product Page title: ${await page.title()}`);
