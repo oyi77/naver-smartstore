@@ -31,6 +31,20 @@ const start = async () => {
     try {
         await server.register(cors); // Register CORS first
 
+        const swaggerServers = [
+            {
+                url: `http://localhost:${process.env.PORT || 3000}`,
+                description: 'Development API Server'
+            }
+        ];
+
+        if (process.env.PUBLIC_API_URL) {
+            swaggerServers.push({
+                url: process.env.PUBLIC_API_URL,
+                description: 'Production API Server'
+            });
+        }
+
         // Register Swagger (Awaiting ensures it's ready)
         await server.register(swagger, {
             openapi: {
@@ -39,7 +53,7 @@ const start = async () => {
                     description: 'Unified API for scraping Naver SmartStore details (Product, Store, Category)',
                     version: '1.2.0'
                 },
-                servers: [{ url: 'http://localhost:3000' }]
+                servers: swaggerServers
             }
         });
 

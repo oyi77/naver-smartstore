@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  app:
+    image: ${DOCKER_IMAGE:-ghcr.io/oyi77/naver-smartstore:latest}
+    container_name: ${CONTAINER_NAME:-naver-smartstore}
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      # Application Configuration
+      - NODE_ENV=production
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Network/Proxy Configuration (can be overridden by env_file)
+      - PROXY_LIST=${PROXY_LIST}
+      - PUBLIC_API_URL=${PUBLIC_API_URL}
+
+    env_file:
+      - ./1panel.env
+
+    volumes:
+      # Use a named volume to avoid host permission issues (Operation not permitted)
+      # This allows Docker to manage the permissions of the data directory directly.
+      - naver-data:/app/data
+
+    networks:
+      - 1panel-network
+
+    # Crucial for Puppeteer to avoid crashing on low memory/shared memory
+    shm_size: '2gb'
+
+    deploy:
+      resources:
+        limits:
+          cpus: '${CPU_LIMIT:-2.0}' # Scraping can be CPU intensive
+          memory: ${MEMORY_LIMIT:-4G} # Puppeteer uses a lot of RAM
+        reservations:
+          cpus: '${CPU_RESERVATION:-0.5}'
+          memory: ${MEMORY_RESERVATION:-1G}
+
+    healthcheck:
+      test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  1panel-network:
+    external: true
+
+volumes:
+  naver-data:

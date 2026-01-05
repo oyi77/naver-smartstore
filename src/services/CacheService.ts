@@ -13,13 +13,33 @@ export class CacheService {
     private readonly TTL_MS = 10 * 60 * 1000; // 10 minutes
 
     constructor() {
-        const dbPath = path.join(__dirname, '../../data/cache.db');
-        const dbDir = path.dirname(dbPath);
-        if (!fs.existsSync(dbDir)) {
-            fs.mkdirSync(dbDir, { recursive: true });
+        // Use process.cwd() (which is /app in Docker) to reliably target the data directory
+        // calculated relative to the project root, not the source file location.
+        const dbDir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+        const dbPath = path.join(dbDir, 'cache.db');
+
+        console.log(`[CacheService] 📂 Using database path: ${dbPath}`);
+
+        try {
+            if (!fs.existsSync(dbDir)) {
+                console.log(`[CacheService] 🔧 Creating data directory: ${dbDir}`);
+                fs.mkdirSync(dbDir, { recursive: true });
+            }
+
+            // Test write permissions
+            try {
+                fs.accessSync(dbDir, fs.constants.W_OK);
+            } catch (err) {
+                console.error(`[CacheService] ❌ Data directory is NOT writable: ${dbDir}`);
+                console.error(`[CacheService] 💡 Hint: If running in Docker with a volume, check host permissions or run as root.`);
+            }
+
+            this.db = new Database(dbPath);
+            this.initialize();
+        } catch (error: any) {
+            console.error(`[CacheService] ❌ Failed to initialize SQLite database:`, error.message);
+            throw error;
         }
-        this.db = new Database(dbPath);
-        this.initialize();
     }
 
     private initialize() {

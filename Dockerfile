@@ -5,25 +5,30 @@ FROM node:20-bookworm-slim AS builder
 
 WORKDIR /app
 
-ENV PUPPETEER_CACHE_DIR=/app/.cache
+# Set Puppeteer cache to the user's home directory to match runtime expectations
+ENV PUPPETEER_CACHE_DIR=/home/node/.cache/puppeteer
 
-# Install build dependencies for native modules (better-sqlite3, etc.)
+# Install build dependencies for native modules
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy package files and install ALL dependencies (including devDeps for building)
+# Copy package files
 COPY package*.json ./
+
+# Install ALL dependencies (including devDeps)
 RUN npm ci
+
+# Explicitly install Chrome to ensure it's in the cache
+RUN npx puppeteer browsers install chrome
 
 # Copy source code and build
 COPY . .
 RUN npm run build
 
-# Remove development dependencies to keep the image small
-# We do this in the builder stage so we can just copy the clean node_modules later
+# Prune dev dependencies
 RUN npm prune --production
 
 # ==========================================
@@ -34,8 +39,6 @@ FROM node:20-bookworm-slim AS runner
 WORKDIR /app
 
 # Install runtime dependencies for Puppeteer (Chromium)
-# We do NOT install the full google-chrome-stable to save space,
-# relying instead on the Chromium version installed by Puppeteer.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fonts-liberation \
@@ -75,20 +78,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy built application and production dependencies from builder
+# Copy built application and dependencies
 COPY --from=builder /app/package.json ./
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/.cache /app/.cache
 
-ENV PUPPETEER_CACHE_DIR=/app/.cache
+# Copy the Puppeteer cache from builder
+COPY --from=builder /home/node/.cache/puppeteer /home/node/.cache/puppeteer
+
+# Ensure correct environment variable is set
+ENV PUPPETEER_CACHE_DIR=/home/node/.cache/puppeteer
 
 # Create data directory and ensure ownership
-RUN mkdir -p /app/data && chown -R node:node /app
+RUN mkdir -p /app/data && \
+    mkdir -p /home/node/.cache/puppeteer && \
+    chown -R node:node /app && \
+    chown -R node:node /home/node/.cache
 
-USER node 
+# Copy and setup entrypoint script
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# USER node (Kept commented out - run as root for permission fixing)
+# USER node 
 
 ENV NODE_ENV=production
 
-# Start the application
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["npm", "start"]
