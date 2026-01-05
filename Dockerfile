@@ -5,6 +5,8 @@ FROM node:20-bookworm-slim AS builder
 
 WORKDIR /app
 
+ENV PUPPETEER_CACHE_DIR=/app/.cache
+
 # Install build dependencies for native modules (better-sqlite3, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
@@ -77,6 +79,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /app/package.json ./
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.cache /app/.cache
+
+ENV PUPPETEER_CACHE_DIR=/app/.cache
 
 # Create data directory and ensure ownership
 RUN mkdir -p /app/data && chown -R node:node /app
