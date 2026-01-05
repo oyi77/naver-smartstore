@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import path from 'path';
+import fs from 'fs';
 
 export interface CacheEntry {
     url: string;
@@ -13,6 +14,10 @@ export class CacheService {
 
     constructor() {
         const dbPath = path.join(__dirname, '../../data/cache.db');
+        const dbDir = path.dirname(dbPath);
+        if (!fs.existsSync(dbDir)) {
+            fs.mkdirSync(dbDir, { recursive: true });
+        }
         this.db = new Database(dbPath);
         this.initialize();
     }
