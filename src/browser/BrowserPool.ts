@@ -16,28 +16,34 @@ export interface BrowserInstance {
     profile: BrowserProfile;
     consecutiveFailures: number;
     isActive: boolean;
+    isRestarting: boolean;
 }
 
 export interface BrowserPoolConfig {
-    browserCount: number;
+    minBrowsers: number;
+    maxBrowsers: number;
+    minTabs: number;
     tabsPerBrowser: number;
     proxiedCount: number; // Number of browsers that should use a proxy
     headless: boolean;
 }
 
 const DEFAULT_CONFIG: BrowserPoolConfig = {
-    browserCount: 3,
+    minBrowsers: 1,
+    maxBrowsers: 3,
+    minTabs: 1,
     tabsPerBrowser: 2,
     proxiedCount: 3,
     headless: false
 };
 
 export class BrowserPool {
-    private browsers: BrowserInstance[] = [];
+    private browsers: Map<number, BrowserInstance> = new Map();
     private proxyManager: ProxyManager;
     private profileManager: ProfileManager;
     private config: BrowserPoolConfig;
     private isInitialized: boolean = false;
+    private pendingLaunches: Set<number> = new Set();
 
     constructor(config: Partial<BrowserPoolConfig> = {}) {
         this.config = { ...DEFAULT_CONFIG, ...config };
@@ -46,41 +52,107 @@ export class BrowserPool {
     }
 
     async initialize(): Promise<void> {
-        console.log(`🚀 Initializing Browser Pool (${this.config.browserCount} browsers × ${this.config.tabsPerBrowser} tabs)`);
+        if (this.isInitialized) return;
+
+        console.log('🚀 Initializing Browser Pool (Dynamic Scaling)');
+        console.log(`   Min: ${this.config.minBrowsers} browsers × ${this.config.minTabs} tabs`);
+        console.log(`   Max: ${this.config.maxBrowsers} browsers × ${this.config.tabsPerBrowser} tabs`);
         console.log(`   Config: ${this.config.proxiedCount} browsers will use proxies`);
 
-        // ALWAYS initialize Proxy Manager (to keep it running/fetching/validating)
+        // Initialize ProxyManager first
         await this.proxyManager.initialize();
 
-        if (this.config.proxiedCount > 0) {
-            if (this.proxyManager.getPoolSize() < this.config.proxiedCount) {
-                console.warn(`⚠️ Not enough proxies (${this.proxyManager.getPoolSize()}), some browsers (target: ${this.config.proxiedCount}) will run without proxy`);
+        // Start with minimum browsers
+        const promises = [];
+        for (let i = 0; i < this.config.minBrowsers; i++) {
+            promises.push(this.createBrowserInstance(i));
+        }
+        await Promise.all(promises);
+
+        console.log(`✅ Browser Pool initialized: ${this.browsers.size} active browsers`);
+        this.isInitialized = true;
+    }
+
+    /**
+     * Scale up browser pool if needed (called by queue when demand increases)
+     */
+    async scaleUp(queueLength: number): Promise<void> {
+        // Calculate true utilization including pending launches
+        let effectiveActive = 0;
+        for (let i = 0; i < this.config.maxBrowsers; i++) {
+            const b = this.browsers.get(i);
+            const isPending = this.pendingLaunches.has(i);
+            // Slot is occupied if it has an active/restarting browser OR if it is currently launching
+            if ((b && (b.isActive || b.isRestarting)) || isPending) {
+                effectiveActive++;
             }
         }
 
-        // Create browsers in parallel
-        const createPromises = [];
-        for (let i = 0; i < this.config.browserCount; i++) {
-            createPromises.push(this.createBrowserInstance(i));
+        const maxCount = this.config.maxBrowsers;
+
+        if (effectiveActive >= maxCount) {
+            return; // Already at max capacity
         }
 
-        await Promise.all(createPromises);
-        this.isInitialized = true;
+        // Scale up if queue is building (more than 2x current capacity)
+        const currentCapacity = effectiveActive * this.config.tabsPerBrowser;
+        if (queueLength > currentCapacity * 2 || effectiveActive === 0) {
+            // Find first available ID
+            let newBrowserId = -1;
+            for (let i = 0; i < maxCount; i++) {
+                const browser = this.browsers.get(i);
+                const isPending = this.pendingLaunches.has(i);
 
-        console.log(`✅ Browser Pool initialized: ${this.browsers.filter(b => b.isActive).length} active browsers`);
+                // Check if slot is empty (no browser map entry or inactive) AND not pending
+                // If isPending is true, we MUST skip
+                // If browser exists: check if active or restarting.
+                const isOccupied = (browser && (browser.isActive || browser.isRestarting)) || isPending;
+
+                if (!isOccupied) {
+                    newBrowserId = i;
+                    break;
+                }
+            }
+
+            if (newBrowserId !== -1) {
+                console.log(`📈 Scaling up: Adding browser ${newBrowserId} (queue: ${queueLength})`);
+                // Start creation in background to avoid blocking the queue processing loop
+                // We rely on pendingLaunches to prevent duplicates
+                this.createBrowserInstance(newBrowserId).catch(err => {
+                    console.error(`[BrowserPool] Scaling error for B${newBrowserId}: ${err instanceof Error ? err.message : String(err)}`);
+                });
+            } else {
+                // Strict logging - no scale allowed
+            }
+        }
     }
 
     private async createBrowserInstance(id: number): Promise<BrowserInstance | null> {
-        const profile = this.profileManager.getRandomProfile();
-        // Determine if this specific browser instance should use a proxy
-        // Logic: if id (0-based) is less than proxiedCount, it uses a proxy.
-        // E.g. proxiedCount=1 -> id 0 uses proxy, id 1+ do not.
-        const shouldUseProxy = id < this.config.proxiedCount;
-        const proxy = shouldUseProxy ? this.proxyManager.getProxy() : null;
+        // Prevent double launch for same ID
+        if (this.pendingLaunches.has(id)) {
+            console.warn(`[BrowserPool] ⚠️ Browser ${id} is already launching. Skipping duplicate request.`);
+            return null;
+        }
 
-        console.log(`[Browser ${id}] Creating with profile: ${profile.name}${proxy ? `, proxy: ${proxy.host}:${proxy.port}` : ', no proxy'}`);
+        this.pendingLaunches.add(id);
+
+        let proxy: ValidatedProxy | null = null;
+        let browser: Browser | null = null; // LIFTED SCOPE
 
         try {
+            const profile = this.profileManager.getRandomProfile();
+            // Determine if this specific browser instance should use a proxy
+            // Logic: Prioritize direct connections for lower browser IDs.
+            // If proxiedCount < maxBrowsers, the first browsers (starting from ID 0) will be direct.
+            const directCount = this.config.maxBrowsers - this.config.proxiedCount;
+            const shouldUseProxy = id >= directCount;
+
+            if (shouldUseProxy) {
+                proxy = await this.proxyManager.getProxy();
+            }
+
+            console.log(`[Browser ${id}] Creating with profile: ${profile.name}${proxy ? `, proxy: ${proxy.host}:${proxy.port}` : ', no proxy'}`);
+
             const args = [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -91,7 +163,7 @@ export class BrowserPool {
                 '--ignore-certificate-errors-spki-list',
             ];
 
-            const browser = await puppeteer.launch({
+            browser = await puppeteer.launch({
                 headless: this.config.headless,
                 args: proxy ? [
                     ...args,
@@ -107,7 +179,8 @@ export class BrowserPool {
                 proxy,
                 profile,
                 consecutiveFailures: 0,
-                isActive: true
+                isActive: true,
+                isRestarting: false
             };
 
             // Create tabs (pages)
@@ -116,17 +189,25 @@ export class BrowserPool {
                 instance.pages.push(page);
             }
 
-            this.browsers[id] = instance;
+            this.browsers.set(id, instance);
             return instance;
 
-        } catch (error) {
-            console.error(`❌ [Browser ${id}] Failed to create:`, error);
+        } catch (error: any) {
+            console.error(`❌ [Browser ${id}] Failed to create:`, error.message);
+
+            // CRITICAL FIX: Clean up the process if it was launched (zombie prevention)
+            if (browser) {
+                console.log(`[BrowserPool] 🧹 Cleaning up failed browser instance for B${id}...`);
+                try { await browser.close(); } catch (e) { }
+            }
 
             if (proxy) {
                 this.proxyManager.markProxyBad(proxy);
             }
 
             return null;
+        } finally {
+            this.pendingLaunches.delete(id);
         }
     }
 
@@ -142,12 +223,47 @@ export class BrowserPool {
         // Apply high-fidelity fingerprinting via StealthInjector
         await StealthInjector.inject(page, profile);
 
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const url = req.url().toLowerCase();
+            const resourceType = req.resourceType() as string;
+
+            // ALWAYS allow main document
+            if (resourceType === 'document') {
+                req.continue().catch(() => { });
+                return;
+            }
+
+            // Block known trackers/ads/analytics
+            if (url.includes('google-analytics') ||
+                url.includes('facebook') ||
+                url.includes('doubleclick') ||
+                url.includes('t.co') ||
+                url.includes('analytics') ||
+                url.includes('beacon')) {
+                // console.log(`[Browser] 🚫 Blocking tracker: ${url}`);
+                req.abort().catch(() => { });
+                return;
+            }
+
+            // Blocking stylesheet can cause issues with Naver's visibility-based rendering
+            // Relieving the block on images/fonts to see if it fixes "BLOCKED_BY_CLIENT" on main page
+            if (['image', 'media', 'font', 'texttrack', 'object', 'csp_report', 'imageset'].includes(resourceType)) {
+                // For now, allow them but maybe log? 
+                // Actually, let's just allow them to ensure stability. 
+                // Optimizing bandwidth is secondary to it actually working.
+                req.abort().catch(() => { });
+            } else {
+                req.continue().catch(() => { });
+            }
+        });
+
         // Warmup
         try {
             console.log(`[Browser] 🌤️ Warming up page: https://smartstore.naver.com/`);
             await page.goto('https://smartstore.naver.com/', {
                 waitUntil: 'domcontentloaded',
-                timeout: 5000
+                timeout: 15000 // Increased from 5s to 15s for proxies
             });
         } catch (e: any) {
             console.warn(`⚠️ Warmup navigation failed: ${e.message}`);
@@ -157,10 +273,10 @@ export class BrowserPool {
     }
 
     async restartBrowser(browserId: number): Promise<void> {
-        const instance = this.browsers[browserId];
+        const instance = this.browsers.get(browserId);
         if (!instance) return;
 
-        console.log(`🔄 [Browser ${browserId}] Restarting with new proxy...`);
+        console.log(`🔄 [Browser ${browserId}] Restarting with fresh instance...`);
 
         // Mark old proxy as bad if it exists
         if (instance.proxy) {
@@ -170,31 +286,88 @@ export class BrowserPool {
         // Release profile
         this.profileManager.releaseProfile(instance.profile);
 
-        // Close old browser
+        // Close old browser aggressively
+        instance.isActive = false;
+        instance.isRestarting = true;
         try {
-            for (const page of instance.pages) {
-                try { await page.close(); } catch (e) { }
-            }
-            await instance.browser.close();
+            // Set a timeout for closing
+            const closePromise = Promise.all([
+                ...instance.pages.map(p => p.close().catch(() => { })),
+                instance.browser.close().catch(() => { })
+            ]);
+
+            // Wait max 5s for cleanup
+            await Promise.race([
+                closePromise,
+                new Promise(r => setTimeout(r, 5000))
+            ]);
         } catch (e) { }
 
-        instance.isActive = false;
-
         // Wait before restart
-        const cooldown = 10000 + Math.random() * 10000;
+        const cooldown = 5000 + Math.random() * 5000;
         console.log(`[Browser ${browserId}] 💤 Cooling down for ${Math.round(cooldown / 1000)}s...`);
         await new Promise(r => setTimeout(r, cooldown));
 
-        // Create new browser with new proxy
+        // Create new browser instance (this will update this.browsers.set(browserId, ...))
         await this.createBrowserInstance(browserId);
     }
 
+    /**
+     * Rotate the profile (User Agent, fingerprint) on a specific page
+     * Used when UNSUPPORTED_BROWSER error occurs - change UA without restarting browser
+     */
+    async rotatePageProfile(browserId: number, tabId: number): Promise<string | null> {
+        const instance = this.browsers.get(browserId);
+        if (!instance || !instance.isActive) {
+            console.warn(`[BrowserPool] Cannot rotate profile - Browser ${browserId} not active`);
+            return null;
+        }
+
+        const page = instance.pages[tabId];
+        if (!page) {
+            console.warn(`[BrowserPool] Cannot rotate profile - Tab ${tabId} not found`);
+            return null;
+        }
+
+        const oldProfileName = instance.profile.name;
+
+        // Release old profile
+        this.profileManager.releaseProfile(instance.profile);
+
+        // Get new profile - may fail if all UAs are blacklisted
+        let newProfile: BrowserProfile;
+        try {
+            newProfile = this.profileManager.getRandomProfile();
+        } catch (e: any) {
+            console.error(`[BrowserPool] ❌ Failed to get new profile: ${e.message}`);
+            return null; // All UAs blacklisted
+        }
+
+        console.log(`[Browser ${browserId}.T${tabId}] 🔄 Rotating profile from "${oldProfileName}" to "${newProfile.name}"`);
+
+        // Re-inject new profile on existing page
+        await StealthInjector.inject(page, newProfile);
+
+        // Update instance reference
+        instance.profile = newProfile;
+
+        return newProfile.name;
+    }
+
+    /**
+     * Get the current profile for a browser
+     */
+    getProfileForBrowser(browserId: number): BrowserProfile | null {
+        const instance = this.browsers.get(browserId);
+        return instance?.profile ?? null;
+    }
+
     getBrowser(browserId: number): BrowserInstance | null {
-        return this.browsers[browserId] || null;
+        return this.browsers.get(browserId) || null;
     }
 
     getPage(browserId: number, tabId: number): Page | null {
-        const browser = this.browsers[browserId];
+        const browser = this.browsers.get(browserId);
         if (!browser || !browser.isActive) return null;
         return browser.pages[tabId] || null;
     }
@@ -202,7 +375,7 @@ export class BrowserPool {
     getAllActivePages(): { browserId: number; tabId: number; page: Page }[] {
         const pages: { browserId: number; tabId: number; page: Page }[] = [];
 
-        for (const browser of this.browsers) {
+        for (const browser of this.browsers.values()) {
             if (browser && browser.isActive) {
                 for (let t = 0; t < browser.pages.length; t++) {
                     pages.push({
@@ -218,7 +391,7 @@ export class BrowserPool {
     }
 
     incrementFailure(browserId: number): number {
-        const browser = this.browsers[browserId];
+        const browser = this.browsers.get(browserId);
         if (browser) {
             browser.consecutiveFailures++;
             return browser.consecutiveFailures;
@@ -227,7 +400,7 @@ export class BrowserPool {
     }
 
     resetFailure(browserId: number): void {
-        const browser = this.browsers[browserId];
+        const browser = this.browsers.get(browserId);
         if (browser) {
             browser.consecutiveFailures = 0;
         }
@@ -236,7 +409,7 @@ export class BrowserPool {
     async shutdown(): Promise<void> {
         console.log('🛑 Shutting down Browser Pool...');
 
-        for (const browser of this.browsers) {
+        for (const browser of this.browsers.values()) {
             if (browser && browser.browser) {
                 try {
                     await browser.browser.close();
@@ -245,19 +418,20 @@ export class BrowserPool {
         }
 
         await this.proxyManager.shutdown();
-        this.browsers = [];
+        this.browsers.clear();
         this.isInitialized = false;
 
         console.log('✅ Browser Pool shutdown complete');
     }
 
     getStats(): { active: number; total: number; proxied: number } {
-        const active = this.browsers.filter(b => b && b.isActive).length;
-        const proxied = this.browsers.filter(b => b && b.isActive && b.proxy).length;
+        const browsers = Array.from(this.browsers.values());
+        const active = browsers.filter(b => b && b.isActive).length;
+        const proxied = browsers.filter(b => b && b.isActive && b.proxy).length;
 
         return {
             active,
-            total: this.config.browserCount,
+            total: this.config.maxBrowsers,
             proxied
         };
     }
@@ -331,7 +505,6 @@ export class BrowserPool {
     }
 }
 
-// Factory function
 export function createBrowserPool(config?: Partial<BrowserPoolConfig>): BrowserPool {
     return new BrowserPool(config);
 }
