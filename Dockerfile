@@ -97,7 +97,8 @@ RUN mkdir -p /app/data && \
 
 # Copy and setup entrypoint script
 COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && \
+    chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # USER node (Kept commented out - run as root for permission fixing)
 # USER node 

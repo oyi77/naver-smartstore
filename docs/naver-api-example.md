@@ -15,7 +15,6 @@
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
     "x-client-version": "20251223161333",
-    "cookie": "_fwb=64yZHNcBilQKAmadi1yUYE.1767538791481; NAC=LCiHB4wxzEqJ; NACT=1; X-Wtm-Cpt-Tk=eQCifbnmrSSnf5_U8_Y8nujnOvnFCeJFN6VpCzhgZHXUXy_-wGeKzz4Hq4cp-r14-UiDhXY_XUv8vhLYQWfFXtEROZV8N7W80XlyLLw5rFZgXqTKkUoFx-q7NApNfZtT0_13e2uR_vxE6N1Tt4lT4HdA6WMv4hv5TY0ypJo0-TG5_ThQmgfMuo22F4RcNfblnQRHqoSScfaGNKU1XHfyEW9pMFUeyRveLszPd_5neu9dr71fxH4KKMTbziR8tvnMJjeECl10rywgn9jd7XUSgZHoqaibL6-RwH49tEUwHCUJMDzGngCz8e6e4lWrakloNOWiGiUk24HjX6WDONou2SrNpqeZN2XTYjE4x_HXwCiQkBJlR0Po7iZ8y0oPxnXTl7cXmVxHHPM6PP0NbqSqTQ==",
     "Referer": "https://smartstore.naver.com/goginara/products/4652047451"
   },
   "body": null,

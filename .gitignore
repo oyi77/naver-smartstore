@@ -41,4 +41,11 @@ cache.db
 cache.db-journal
 browser-profile
 .cursor
+
+# Data files (except default configs)
 data/*.json
+!data/default_proxy_sources.json
+# Preload cache database
+*.db
+# Large preloaded data files
+docs/preloaded_data.json

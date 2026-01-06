@@ -9,16 +9,22 @@ export interface CacheEntry {
 }
 
 export class CacheService {
+    private static instance: CacheService | null = null;
     private db: Database.Database;
-    private readonly TTL_MS = 10 * 60 * 1000; // 10 minutes
+    private readonly ttlMinutes: number;
 
-    constructor() {
+    private constructor() {
         // Use process.cwd() (which is /app in Docker) to reliably target the data directory
         // calculated relative to the project root, not the source file location.
         const dbDir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
         const dbPath = path.join(dbDir, 'cache.db');
 
+        // Parse CACHE_TTL: -1 = infinite, 0 = disabled, N = minutes (default 10)
+        const envTTL = process.env.CACHE_TTL ? parseInt(process.env.CACHE_TTL) : 10;
+        this.ttlMinutes = isNaN(envTTL) ? 10 : envTTL;
+
         console.log(`[CacheService] 📂 Using database path: ${dbPath}`);
+        console.log(`[CacheService] ⏱️ TTL Config: ${this.ttlMinutes === -1 ? 'Infinite' : this.ttlMinutes === 0 ? 'Disabled' : this.ttlMinutes + ' minutes'}`);
 
         try {
             if (!fs.existsSync(dbDir)) {
@@ -51,16 +57,21 @@ export class CacheService {
             )
         `);
         // Periodic cleanup
-        setInterval(() => this.cleanup(), 60 * 1000); // Check every minute
+        if (this.ttlMinutes > 0) {
+            setInterval(() => this.cleanup(), 60 * 1000); // Check every minute
+        }
     }
 
     get(url: string): any | null {
+        if (this.ttlMinutes === 0) return null; // Cache disabled
+
         try {
             const row = this.db.prepare('SELECT data, timestamp FROM cache WHERE url = ?').get(url) as any;
 
             if (!row) return null;
 
-            if (Date.now() - row.timestamp > this.TTL_MS) {
+            // If TTL is -1, it never expires. Otherwise check difference
+            if (this.ttlMinutes !== -1 && (Date.now() - row.timestamp > this.ttlMinutes * 60 * 1000)) {
                 this.delete(url);
                 return null;
             }
@@ -73,6 +84,8 @@ export class CacheService {
     }
 
     set(url: string, data: any) {
+        if (this.ttlMinutes === 0) return; // Cache disabled
+
         try {
             const stmt = this.db.prepare('INSERT OR REPLACE INTO cache (url, data, timestamp) VALUES (?, ?, ?)');
             stmt.run(url, JSON.stringify(data), Date.now());
@@ -90,11 +103,20 @@ export class CacheService {
     }
 
     private cleanup() {
+        if (this.ttlMinutes <= 0) return; // No cleanup for infinite or disabled (disabled writes nothing anyway usually, but safeguard)
+
         try {
-            const cutoff = Date.now() - this.TTL_MS;
+            const cutoff = Date.now() - (this.ttlMinutes * 60 * 1000);
             this.db.prepare('DELETE FROM cache WHERE timestamp < ?').run(cutoff);
         } catch (e) {
             console.error('Cache cleanup error:', e);
         }
+    }
+
+    static getInstance(): CacheService {
+        if (!CacheService.instance) {
+            CacheService.instance = new CacheService();
+        }
+        return CacheService.instance;
     }
 }

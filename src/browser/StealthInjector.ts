@@ -3,62 +3,76 @@ import { BrowserProfile } from '../proxy/types';
 
 export class StealthInjector {
     static async inject(page: Page, profile: BrowserProfile) {
-        // Standardize headers
-        await page.setExtraHTTPHeaders({
-            'sec-ch-ua': profile.secChUa || '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': profile.secChUaPlatform || '"macOS"',
-        });
-
-        // Set User Agent
+        // 1. Set User Agent
         await page.setUserAgent(profile.userAgent);
 
-        // Apply high-fidelity fingerprinting manually
-        await page.evaluateOnNewDocument((p, v, m, c, l, ua) => {
+        // 2. Set Client Hints (Critical for Naver)
+        await page.setExtraHTTPHeaders({
+            'sec-ch-ua': profile.secChUa || '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+            'sec-ch-ua-mobile': profile.userAgent.includes('Mobile') ? '?1' : '?0',
+            'sec-ch-ua-platform': profile.secChUaPlatform || '"Windows"',
+        });
+
+        // 3. Apply high-fidelity fingerprinting
+        await page.evaluateOnNewDocument((profile) => {
             // Navigator platform override
-            Object.defineProperty(navigator, 'platform', { get: () => p });
+            Object.defineProperty(navigator, 'platform', { get: () => profile.platform });
             // Vendor override
-            Object.defineProperty(navigator, 'vendor', { get: () => v });
+            Object.defineProperty(navigator, 'vendor', { get: () => profile.vendor });
             // Hardware concurrency
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => c });
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => profile.hardwareConcurrency });
             // Device memory
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => m });
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => profile.deviceMemory });
             // Languages
-            Object.defineProperty(navigator, 'languages', { get: () => l });
-            // App Version
+            Object.defineProperty(navigator, 'languages', { get: () => profile.languages });
+            // App Version - derived from UA
             // @ts-ignore
-            Object.defineProperty(navigator, 'appVersion', { get: () => ua.split('Mozilla/')[1] });
+            Object.defineProperty(navigator, 'appVersion', { get: () => profile.userAgent.split('Mozilla/')[1] });
 
             // Webdriver hide
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
 
             // Mock chrome object
-            (window as any).chrome = {
+            // @ts-ignore
+            window.chrome = {
                 runtime: {},
                 loadTimes: function () { },
                 csi: function () { },
                 app: {}
             };
 
-            // Mock plugins
-            const mockPlugins = [
-                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
-            ];
+            // Plugin handling (Desktop usually has PDF viewer, Mobile has none)
+            if (profile.platform === 'Win32' || profile.platform === 'MacIntel') {
+                const pdfDesc = 'Portable Document Format';
+                const pdfFn = 'internal-pdf-viewer';
 
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => mockPlugins.map(p => ({
-                    ...p,
-                    length: 1,
-                    item: () => p,
-                    namedItem: () => p
-                }))
-            });
-        }, profile.platform, profile.vendor, profile.deviceMemory, profile.hardwareConcurrency, profile.languages, profile.userAgent);
+                const plugins = [
+                    { name: 'PDF Viewer', filename: pdfFn, description: pdfDesc },
+                    { name: 'Chrome PDF Viewer', filename: pdfFn, description: pdfDesc },
+                    { name: 'Chromium PDF Viewer', filename: pdfFn, description: pdfDesc },
+                    { name: 'Microsoft Edge PDF Viewer', filename: pdfFn, description: pdfDesc },
+                    { name: 'WebKit built-in PDF', filename: pdfFn, description: pdfDesc }
+                ];
 
-        // Set viewport
-        await page.setViewport(profile.viewport);
+                // @ts-ignore
+                Object.defineProperty(navigator, 'plugins', {
+                    // @ts-ignore
+                    get: () => plugins
+                });
+            } else {
+                // @ts-ignore
+                Object.defineProperty(navigator, 'plugins', { get: () => [] });
+            }
+
+        }, profile);
+
+        // 4. Set Viewport
+        const isMobile = profile.userAgent.includes('Mobile');
+        await page.setViewport({
+            width: profile.viewport.width,
+            height: profile.viewport.height,
+            isMobile: isMobile,
+            hasTouch: isMobile
+        });
     }
 }

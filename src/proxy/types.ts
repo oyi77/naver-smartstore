@@ -9,6 +9,8 @@ export interface RawProxy {
     source: string;
     username?: string;
     password?: string;
+    isRotating?: boolean;
+    rotatingConfig?: RotatingProxyConfig;
 }
 
 export interface ValidatedProxy extends RawProxy {
@@ -22,6 +24,8 @@ export interface ValidatedProxy extends RawProxy {
     canAccessNaver: boolean;
     isp?: string;
     org?: string;
+    lastUsed?: Date;
+    penaltyUntil?: Date;
 }
 
 export interface ProxyTestResult {
@@ -45,4 +49,115 @@ export interface BrowserProfile {
     deviceMemory: number;
     secChUa: string;
     secChUaPlatform: string;
+}
+
+// ============================================================================
+// Rotating Proxy Types
+// ============================================================================
+
+export interface RotatingProxyConfig {
+    providerId: string;
+    providerType: 'webshare' | 'thordata' | 'custom';
+    refreshInterval?: number; // ms between proxy refreshes
+}
+
+export interface ProviderStats {
+    name: string;
+    type: string;
+    status: 'active' | 'inactive' | 'error';
+    totalProxies: number;
+    activeProxies: number;
+    avgLatency: number;
+    successRate: number;
+    lastRefresh?: Date;
+    error?: string;
+}
+
+// ============================================================================
+// Provider Configuration Types
+// ============================================================================
+
+export interface WebshareConfig {
+    apiKey: string;
+    apiUrl?: string; // default: https://proxy.webshare.io/api/v2/
+    mode?: 'rotating' | 'list'; // rotating = use rotating endpoint, list = fetch list
+    country?: string;
+    protocol?: 'http' | 'socks5';
+    autoRefresh?: boolean;
+    refreshInterval?: number; // seconds
+}
+
+export interface ThordataConfig {
+    username: string;
+    password: string;
+    endpoint: string; // e.g., gate.smartproxy.com:7000
+    country?: string;
+    sessionPrefix?: string; // For session-based rotation
+    protocol?: 'http' | 'socks5';
+}
+
+export interface CustomProviderConfig {
+    name: string;
+    endpoint: string;
+    authHeader?: string;
+    format?: ProxyFormat;
+    refreshInterval?: number;
+}
+
+// ============================================================================
+// Parser Types
+// ============================================================================
+
+export enum ProxyFormat {
+    JSON = 'json',
+    TXT = 'txt',
+    CSV = 'csv',
+    INLINE = 'inline',
+    UNKNOWN = 'unknown'
+}
+
+export interface ProxyParseResult {
+    proxies: RawProxy[];
+    format: ProxyFormat;
+    errors: string[];
+    total: number;
+    valid: number;
+}
+
+// ============================================================================
+// Rotation Strategy Types
+// ============================================================================
+
+export enum RotationStrategy {
+    ROUND_ROBIN = 'ROUND_ROBIN',
+    LATENCY_BASED = 'LATENCY_BASED',
+    WEIGHTED = 'WEIGHTED',
+    STICKY_SESSION = 'STICKY_SESSION',
+    RANDOM = 'RANDOM'
+}
+
+// ============================================================================
+// Metrics Types
+// ============================================================================
+
+export interface ProxyMetrics {
+    totalProxies: number;
+    naverReady: number;
+    byProtocol: Record<string, number>;
+    byType: Record<string, number>;
+    bySource: Record<string, number>;
+    rotatingProviders: number;
+    avgLatency: number;
+    successRate: number;
+    lastValidation?: Date;
+    validationDuration?: number;
+}
+
+export interface ProxyPoolConfig {
+    maxSize: number;
+    minSize: number;
+    validationInterval: number; // ms
+    revalidationThreshold: number; // ms
+    batchSize: number;
+    rotationStrategy: RotationStrategy;
 }

@@ -36,14 +36,23 @@ interface ScraperState {
     allProductIds: string[];
     processedIds: string[];
     failedIds: string[];
+    uaStats?: Record<string, { success: number; fail: number }>;
 }
 
 class StateManager {
     static load(): ScraperState {
         if (fs.existsSync(STATE_FILE)) {
-            return JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+            const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+            return {
+                channelId: null,
+                allProductIds: [],
+                processedIds: [],
+                failedIds: [],
+                uaStats: {},
+                ...state
+            };
         }
-        return { channelId: null, allProductIds: [], processedIds: [], failedIds: [] };
+        return { channelId: null, allProductIds: [], processedIds: [], failedIds: [], uaStats: {} };
     }
 
     static save(state: ScraperState) {
@@ -68,6 +77,8 @@ class TaskDispatcher {
 
     constructor(state: ScraperState) {
         this.state = state;
+        if (!this.state.uaStats) this.state.uaStats = {};
+
         const processedSet = new Set(this.state.processedIds);
         this.queue = this.state.allProductIds.filter(id => !processedSet.has(id));
 
@@ -85,17 +96,31 @@ class TaskDispatcher {
         return this.queue.shift() || null;
     }
 
-    markProcessed(id: string) {
+    markProcessed(id: string, ua?: string) {
         if (!this.state.processedIds.includes(id)) {
             this.state.processedIds.push(id);
             this.state.failedIds = this.state.failedIds.filter(fid => fid !== id);
+
+            if (ua) {
+                if (!this.state.uaStats) this.state.uaStats = {};
+                if (!this.state.uaStats[ua]) this.state.uaStats[ua] = { success: 0, fail: 0 };
+                this.state.uaStats[ua].success++;
+            }
+
             StateManager.save(this.state);
         }
     }
 
-    markFailed(id: string) {
+    markFailed(id: string, ua?: string) {
         if (!this.state.failedIds.includes(id) && !this.state.processedIds.includes(id)) {
             this.state.failedIds.push(id);
+
+            if (ua) {
+                if (!this.state.uaStats) this.state.uaStats = {};
+                if (!this.state.uaStats[ua]) this.state.uaStats[ua] = { success: 0, fail: 0 };
+                this.state.uaStats[ua].fail++;
+            }
+
             StateManager.save(this.state);
         }
     }
@@ -169,10 +194,8 @@ class BrowserCoordinator {
                 }
             });
 
-            await page.setRequestInterception(true);
-            page.on('request', (request: any) => {
-                request.continue();
-            });
+            // Request interception is already handled by BrowserPool
+            // Do not add another listener that calls request.continue() blindly
         }
 
         // Parallel warm-up for all tabs
@@ -255,11 +278,28 @@ class BrowserCoordinator {
         }
     }
 
-    async rotateTab(tab: TabState) {
+    async rotateTab(tab: TabState, forceNewProfile: boolean = false) {
         this.tabRotationCount++;
-        console.log(`[B${this.browserId}.T${tab.id}] ♻️ Rotating tab (Total: ${this.tabRotationCount})...`);
+        console.log(`[B${this.browserId}.T${tab.id}] ♻️ Rotating tab${forceNewProfile ? ' WITH NEW PROFILE' : ''} (Total: ${this.tabRotationCount})...`);
 
         try {
+            // If forceNewProfile, change the UA/fingerprint before warmup
+            if (forceNewProfile) {
+                const oldProfileName = tab.profile.name;
+                const ProfileManager = await import('../src/profiles/ProfileManager');
+                const manager = new ProfileManager.ProfileManager();
+                const newProfile = manager.getRandomProfile();
+
+                console.log(`[B${this.browserId}.T${tab.id}] 🔄 Rotating profile from "${oldProfileName}" to "${newProfile.name}"`);
+
+                // Re-inject new profile
+                const StealthInjector = await import('../src/browser/StealthInjector');
+                await StealthInjector.StealthInjector.inject(tab.page, newProfile);
+
+                // Update tab reference
+                tab.profile = newProfile;
+            }
+
             await tab.page.goto('about:blank');
             await new Promise(r => setTimeout(r, 1000));
             await this.warmUpTab(tab);
@@ -306,28 +346,33 @@ class BrowserCoordinator {
 
                 if (result.success && result.data) {
                     this.results.push(result.data);
-                    this.dispatcher.markProcessed(productId);
+                    this.dispatcher.markProcessed(productId, tab.profile.userAgent);
                     StateManager.saveData(this.results);
                     const stats = this.dispatcher.getStats();
                     console.log(`[${workerId}] ✅ Saved product ${productId} (${stats.processed}/${stats.total})`);
                     this.failureCount = 0;
                 } else if (result.error === 'RATELIMIT') {
                     console.log(`[${workerId}] 🛑 Rate limited (429). Rotating and resting...`);
-                    this.dispatcher.markFailed(productId);
+                    this.dispatcher.markFailed(productId, tab.profile.userAgent);
                     await this.rotateTab(tab);
                     tab.restingUntil = Date.now() + 60000;
                 } else if (result.error === 'NOT_FOUND' || result.error === '204_NO_CONTENT') {
                     console.log(`[${workerId}] ⚠️ ${result.error}. Product ${productId} re-queued.`);
-                    this.dispatcher.markFailed(productId);
+                    this.dispatcher.markFailed(productId, tab.profile.userAgent);
                     await this.rotateTab(tab);
+                    tab.restingUntil = Date.now() + 5000;
+                } else if (result.error === 'UNSUPPORTED_BROWSER') {
+                    console.log(`[${workerId}] 🚨 UNSUPPORTED BROWSER DETECTED! Rotating with NEW UA/Fingerprint...`);
+                    this.dispatcher.markFailed(productId, tab.profile.userAgent);
+                    await this.rotateTab(tab, true); // Force new profile!
                     tab.restingUntil = Date.now() + 5000;
                 } else {
                     console.log(`[${workerId}] ❌ Failed: ${result.error}`);
-                    this.dispatcher.markFailed(productId);
+                    this.dispatcher.markFailed(productId, tab.profile.userAgent);
                     this.failureCount++;
                 }
             } catch (e: any) {
-                this.dispatcher.markFailed(productId);
+                this.dispatcher.markFailed(productId, tab.profile.userAgent);
                 this.failureCount++;
                 console.log(`[${workerId}] ❌ Error: ${e.message}`);
             }
@@ -342,11 +387,72 @@ class BrowserCoordinator {
         }
     }
 
+
+    async humanRecoveryDance(page: any) {
+        console.log(`[B${this.browserId}] 💃 Performing Human Recovery Dance...`);
+        try {
+            // 1. Go Back / Refresh
+            await page.goBack();
+            await new Promise(r => setTimeout(r, 1500));
+
+            // 2. Scroll a bit on the previous page (likely store page)
+            await page.evaluate(() => window.scrollBy(0, 300));
+            await new Promise(r => setTimeout(r, 1000));
+
+            // 3. Click random product (if possible) or just navigate to a random one
+            if (this.state.allProductIds.length > 0) {
+                const randomId = this.state.allProductIds[Math.floor(Math.random() * this.state.allProductIds.length)];
+                console.log(`[B${this.browserId}] 🎲 Random walk to ${randomId}...`);
+                await page.goto(`${STORE_URL}/products/${randomId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await this.simulateHumanBehavior(page);
+            }
+        } catch (e) {
+            console.log(`[B${this.browserId}] Recovery dance stumbled: ${(e as any).message}`);
+        }
+    }
+
     async processProduct(page: any, productId: string) {
         const productUrl = `${STORE_URL}/products/${productId}`;
         const channelId = this.state.channelId;
+        const self = this;
 
         if (!channelId) return { success: false, error: 'NO_CHANNEL_ID' };
+
+        // Helper to perform the fetch
+        const performFetch = async () => {
+            console.log(`[B${self.browserId}] 📡 Executing API fetch for ${productId}...`);
+            return await page.evaluate(async (pid: string, cid: string, pUrl: string) => {
+                const endpoint = `https://smartstore.naver.com/i/v2/channels/${cid}/products/${pid}?withWindow=false`;
+                try {
+                    const response = await fetch(endpoint, {
+                        method: 'GET',
+                        mode: 'cors',
+                        credentials: 'include',
+                        headers: {
+                            'accept': 'application/json, text/plain, */*',
+                            'accept-language': 'en-US,en;q=0.5',
+                            'content-type': 'application/json',
+                            'x-client-version': '20251223161333',
+                            'sec-fetch-dest': 'empty',
+                            'sec-fetch-mode': 'cors',
+                            'sec-fetch-site': 'same-origin',
+                            'pragma': 'no-cache',
+                            'cache-control': 'no-cache',
+                            'referer': pUrl
+                        }
+                    });
+
+                    if (response.status === 204) return { success: false, error: '204_NO_CONTENT' };
+                    if (response.status === 429) return { success: false, error: 'RATELIMIT' };
+                    if (!response.ok) return { success: false, error: `HTTP_${response.status}` };
+
+                    const data = await response.json();
+                    return { success: true, data };
+                } catch (e: any) {
+                    return { success: false, error: e.message };
+                }
+            }, productId, channelId, productUrl);
+        };
 
         try {
             await page.goto(productUrl, { waitUntil: 'networkidle2', timeout: 30000 });
@@ -356,38 +462,31 @@ class BrowserCoordinator {
             return { success: false, error: `NAV_FAILED: ${e.message}` };
         }
 
-        console.log(`[B${this.browserId}] 📡 Executing API fetch for ${productId}...`);
-        return await page.evaluate(async (pid: string, cid: string, pUrl: string) => {
-            const endpoint = `https://smartstore.naver.com/i/v2/channels/${cid}/products/${pid}?withWindow=false`;
+        // First Try
+        let result = await performFetch();
+
+        // Retry Logic
+        if (!result.success && (
+            result.error === '204_NO_CONTENT' ||
+            result.error === 'RATELIMIT' ||
+            (typeof result.error === 'string' && result.error.includes('HTTP_490'))
+        )) {
+            console.log(`[B${this.browserId}] ⚠️ Encountered ${result.error}. Retrying with Dance...`);
+            await this.humanRecoveryDance(page);
+
+            // Navigate back to target product
             try {
-                const response = await fetch(endpoint, {
-                    method: 'GET',
-                    mode: 'cors',
-                    credentials: 'include',
-                    headers: {
-                        'accept': 'application/json, text/plain, */*',
-                        'accept-language': 'en-US,en;q=0.5',
-                        'content-type': 'application/json',
-                        'x-client-version': '20251223161333',
-                        'sec-fetch-dest': 'empty',
-                        'sec-fetch-mode': 'cors',
-                        'sec-fetch-site': 'same-origin',
-                        'pragma': 'no-cache',
-                        'cache-control': 'no-cache',
-                        'referer': pUrl
-                    }
-                });
-
-                if (response.status === 204) return { success: false, error: '204_NO_CONTENT' };
-                if (response.status === 429) return { success: false, error: 'RATELIMIT' };
-                if (!response.ok) return { success: false, error: `HTTP_${response.status}` };
-
-                const data = await response.json();
-                return { success: true, data };
-            } catch (e: any) {
-                return { success: false, error: e.message };
+                await page.goto(productUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+                await new Promise(r => setTimeout(r, 1000));
+            } catch (e) {
+                return { success: false, error: 'RETRY_NAV_FAILED' };
             }
-        }, productId, channelId, productUrl);
+
+            // Second Try
+            result = await performFetch();
+        }
+
+        return result;
     }
 }
 
@@ -486,7 +585,7 @@ async function run() {
     const results = StateManager.loadData();
 
     const browserPool = new BrowserPool({
-        browserCount: 2,
+        maxBrowsers: 2,
         tabsPerBrowser: 1,
         proxiedCount: 2, // All proxied
         headless: false
