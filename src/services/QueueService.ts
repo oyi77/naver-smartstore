@@ -27,8 +27,10 @@ export class QueueService {
     private processing: Set<string> = new Set();
     private isProcessing: boolean = false;
     private isInitialized: boolean = false;
-    private redis: Redis;
+    private redis: Redis | null = null;
     private redisPrefix: string;
+    private hasLoggedRedisError: boolean = false;
+    private hasCleanedUpBackup: boolean = false;
     private backupFile = path.resolve(process.cwd(), 'data', 'queue_backup.json');
     private readonly JOB_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours for completed/failed jobs
 
@@ -75,18 +77,63 @@ export class QueueService {
             headless: headless
         });
 
-        // Initialize Redis
-        this.redis = new Redis({
-            host: process.env.REDIS_HOST || 'localhost',
-            port: parseInt(process.env.REDIS_PORT || '6379'),
-            password: process.env.REDIS_PASSWORD || undefined,
-            retryStrategy: (times) => Math.min(times * 50, 2000)
-        });
-        this.redisPrefix = process.env.REDIS_PREFIX || 'naver_scraper:';
+        // Initialize Redis if enabled
+        const useRedis = process.env.USE_REDIS === 'true';
+        if (useRedis) {
+            this.redis = new Redis({
+                host: process.env.REDIS_HOST || 'localhost',
+                port: parseInt(process.env.REDIS_PORT || '6379'),
+                password: process.env.REDIS_PASSWORD || undefined,
+                retryStrategy: (times) => {
+                    // Always try to reconnect in background
+                    return Math.min(times * 500, 30000); // Max delay 30s
+                },
+                maxRetriesPerRequest: 0, // Fail fast, don't hang commands
+                enableOfflineQueue: false, // Don't queue while disconnected
+                connectTimeout: 5000
+            });
 
-        this.redis.on('error', (err) => {
-            console.error(`[Redis] ❌ Connection error: ${err.message}`);
-        });
+            this.redis.on('connect', () => {
+                console.log(`[Redis] 📡 Attempting connection...`);
+            });
+
+            this.redis.on('ready', () => {
+                console.log(`[Redis] ✅ Connected and ready. Syncing local state to Redis...`);
+                this.hasLoggedRedisError = false; // Reset error flag
+                this.saveState().then(() => {
+                    // After successful sync, delete redundant JSON backup if it exists
+                    if (!this.hasCleanedUpBackup && fs.existsSync(this.backupFile)) {
+                        try {
+                            fs.unlinkSync(this.backupFile);
+                            console.log(`[Queue] 🧹 Deleted redundant JSON backup: ${this.backupFile}`);
+                            this.hasCleanedUpBackup = true;
+                        } catch (e: any) {
+                            console.warn(`[Queue] ⚠️ Failed to delete redundant backup: ${e.message}`);
+                        }
+                    }
+                }).catch(e => {
+                    console.error(`[Redis] ❌ Initial sync failed: ${e.message}`);
+                });
+            });
+
+            this.redis.on('error', (err) => {
+                const msg = err.message || 'Unknown error';
+                const isConnError = msg.includes('ECONNREFUSED') || msg.includes('ETIMEDOUT') || msg.includes('ENETUNREACH');
+
+                if (isConnError) {
+                    if (!this.hasLoggedRedisError) {
+                        console.warn(`[Redis] ⚠️ Connection failed (${msg}). Retrying in background... (Using JSON fallback)`);
+                        this.hasLoggedRedisError = true;
+                    }
+                } else {
+                    console.error(`[Redis] ❌ Error: ${msg}`);
+                }
+            });
+        } else {
+            console.log(`[QueueService] ℹ️ Redis is disabled (USE_REDIS=false). Using JSON fallback for persistence.`);
+        }
+
+        this.redisPrefix = process.env.REDIS_PREFIX || 'naver_scraper:';
     }
 
     static getInstance(): QueueService {
@@ -101,7 +148,7 @@ export class QueueService {
         await this.browserPool.initialize();
         this.isInitialized = true;
         this.processQueue(); // Start processing loop
-        
+
         // Start periodic job cleanup
         setInterval(() => this.cleanupOldJobs(), 60 * 60 * 1000); // Every hour
     }
@@ -113,7 +160,7 @@ export class QueueService {
         try {
             const cutoff = Date.now() - this.JOB_TTL_MS;
             let cleaned = 0;
-            
+
             for (const [id, job] of Array.from(this.jobs.entries())) {
                 // Only cleanup completed or failed jobs that are old
                 if ((job.status === 'COMPLETED' || job.status === 'FAILED') && job.timestamp < cutoff) {
@@ -121,7 +168,7 @@ export class QueueService {
                     cleaned++;
                 }
             }
-            
+
             if (cleaned > 0) {
                 console.log(`[Queue] 🧹 Cleaned up ${cleaned} old jobs`);
                 this.saveState(); // Persist cleanup
@@ -164,7 +211,7 @@ export class QueueService {
 
     addJob(url: string, type: JobType, options: { customProxy?: string } = {}): Job {
         const normalizedUrl = this.normalizeUrl(url);
-        
+
         // Check if job exists and is valid (not failed/completed long ago)
         const existingJobId = Array.from(this.jobs.keys()).find(id => {
             const job = this.jobs.get(id);
@@ -220,9 +267,10 @@ export class QueueService {
         }
         return job;
     }
-    
+
     private async refreshJobFromRedis(id: string): Promise<void> {
         try {
+            if (!this.redis || this.redis.status !== 'ready') throw new Error('Redis not ready');
             const jobJson = await this.redis.hget(`${this.redisPrefix}jobs`, id);
             if (jobJson) {
                 const redisJob = JSON.parse(jobJson) as Job;
@@ -232,8 +280,8 @@ export class QueueService {
                 if (memJob && redisJob.result) {
                     // Always update if Redis has result (could be partial or full)
                     // Check if Redis result is newer or if in-memory doesn't have result
-                    if (!memJob.result || 
-                        (redisJob.result as any)._isPartial || 
+                    if (!memJob.result ||
+                        (redisJob.result as any)._isPartial ||
                         (redisJob.timestamp && memJob.timestamp && redisJob.timestamp > memJob.timestamp)) {
                         memJob.result = redisJob.result;
                         console.log(`[Queue] 🔄 Refreshed job ${id} result from Redis (hasPartial: ${!!(redisJob.result as any)?._isPartial})`);
@@ -242,7 +290,9 @@ export class QueueService {
             }
         } catch (e: any) {
             // Redis failed, try JSON fallback
-            console.warn(`[Queue] ⚠️ Redis error during refresh: ${e.message}. Trying JSON fallback...`);
+            if (e.message !== 'Redis not ready') {
+                console.warn(`[Queue] ⚠️ Redis error during refresh: ${e.message}. Trying JSON fallback...`);
+            }
             try {
                 if (fs.existsSync(this.backupFile)) {
                     const data = JSON.parse(fs.readFileSync(this.backupFile, 'utf-8'));
@@ -253,8 +303,8 @@ export class QueueService {
                             const memJob = this.jobs.get(id);
                             // Update in-memory job with backup data if backup has a result
                             if (memJob && backupJob.result) {
-                                if (!memJob.result || 
-                                    (backupJob.result as any)._isPartial || 
+                                if (!memJob.result ||
+                                    (backupJob.result as any)._isPartial ||
                                     (backupJob.timestamp && memJob.timestamp && backupJob.timestamp > memJob.timestamp)) {
                                     memJob.result = backupJob.result;
                                     console.log(`[Queue] 🔄 Refreshed job ${id} result from JSON backup (hasPartial: ${!!(backupJob.result as any)?._isPartial})`);
@@ -284,6 +334,7 @@ export class QueueService {
 
     private async saveState() {
         try {
+            if (!this.redis || this.redis.status !== 'ready') throw new Error('Redis not ready');
             // Redis Sync: Save all jobs and the queue
             const pipeline = this.redis.pipeline();
 
@@ -300,7 +351,9 @@ export class QueueService {
 
             await pipeline.exec();
         } catch (e: any) {
-            console.error(`[Queue] ❌ Failed to save state to Redis: ${e.message}`);
+            if (e.message !== 'Redis not ready') {
+                console.error(`[Queue] ❌ Failed to save state to Redis: ${e.message}`);
+            }
 
             // Fallback to JSON
             try {
@@ -325,6 +378,7 @@ export class QueueService {
 
     private async loadState() {
         try {
+            if (!this.redis || this.redis.status !== 'ready') throw new Error('Redis not ready');
             console.log(`[Queue] 📡 Connecting to Redis at ${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}...`);
 
             // Load all jobs
@@ -622,7 +676,7 @@ export class QueueService {
                         };
                         // Update timestamp to ensure Redis has latest
                         job.timestamp = Date.now();
-                        
+
                         // Save to Redis immediately so controller can retrieve it
                         await this.saveState();
                         console.log(`[Queue] ✅ Saved partial data to Redis for job ${job.id}`);
